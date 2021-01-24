@@ -632,6 +632,7 @@ int main(int argc, char **argv) {
 	  };
 
 	float milliseconds = 0;
+	float milliseconds_1 = 0;
 	cudaEvent_t start, stop;
 	cudaErrCheck(cudaEventCreate(&start));
 	cudaErrCheck(cudaEventCreate(&stop));
@@ -653,14 +654,18 @@ int main(int argc, char **argv) {
 	// 						// alpha, beta,
 	// 						wmma_grid_dim_x, wmma_block_dim_x, tzgemm_iter)));
 	checkCudaErrors(cudaFuncSetAttribute(
-        compute_gemm, cudaFuncAttributeMaxDynamicSharedMemorySize, SHMEM_SZ));
-    checkKernelErrors(
+		compute_gemm, cudaFuncAttributeMaxDynamicSharedMemorySize, SHMEM_SZ));
+		
+	for(int i = 0; i < tzgemm_iter; i++)
+	{
+		checkKernelErrors(
         (compute_gemm<<<deviceProp.multiProcessorCount, THREADS_PER_BLOCK, SHMEM_SZ>>>(ori_wmma_A, ori_wmma_B, ori_wmma_C, ori_wmma_C, alpha_g, beta_g, M_GLOBAL, N_GLOBAL, K_GLOBAL)));
-						
+	}
+
 	cudaErrCheck(cudaEventRecord(stop));
 	cudaErrCheck(cudaEventSynchronize(stop));
 	cudaErrCheck(cudaEventElapsedTime(&milliseconds, start, stop));
-	printf("tzgemm took %f ms\n", milliseconds);
+	printf("tzgemm took %f us\n", milliseconds * 1000 / tzgemm_iter);
 
 	cudaErrCheck(cudaMemcpy(ori_result_C, ori_wmma_C, sizeof(float) * M_GLOBAL * N_GLOBAL, cudaMemcpyDeviceToHost));
 
@@ -669,6 +674,9 @@ int main(int argc, char **argv) {
 	cublasErrCheck(cublasSetMathMode(cublasHandle, CUBLAS_TENSOR_OP_MATH));
 	printf("Running with cuBLAS...\n");
 	cudaErrCheck(cudaEventRecord(start));
+
+	for(int i = 0; i < tzgemm_iter; i++)
+	{
 	cublasErrCheck(cublasGemmEx(cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N, 
 				N_GLOBAL, M_GLOBAL, K_GLOBAL, 
 				&alpha_g,
@@ -677,10 +685,14 @@ int main(int argc, char **argv) {
 				&beta_g, 
 				cublas_wmma_C, CUDA_R_32F, N_GLOBAL,
 				CUDA_R_32F, CUBLAS_GEMM_DFALT_TENSOR_OP));
+	}
 	cudaErrCheck(cudaEventRecord(stop));
 	cudaErrCheck(cudaEventSynchronize(stop));
-	cudaErrCheck(cudaEventElapsedTime(&milliseconds, start, stop));
-	printf("cublas took %f us\n", milliseconds * 1000);
+	cudaErrCheck(cudaEventElapsedTime(&milliseconds_1, start, stop));
+	printf("cublas took %f us\n", milliseconds_1 * 1000 / tzgemm_iter);
+
+	printf("Ratio of cuBLAS : %f \n", (milliseconds_1 / milliseconds * 100));
+
 
 	cudaErrCheck(cudaMemcpy(cublas_result_C, cublas_wmma_C, sizeof(float) * M_GLOBAL * N_GLOBAL, cudaMemcpyDeviceToHost));
 
