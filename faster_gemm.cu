@@ -81,8 +81,8 @@
 // nvcuda::wmma::load_matrix_sync.
 #define SKEW_HALF 16
 
-const float alpha_g = 1.1f;
-const float beta_g = 1.2f;
+const float alpha_g = 1;
+const float beta_g = 0;
 
 #define cudaErrCheck(stat) { cudaErrCheck_((stat), __FILE__, __LINE__); }
 void cudaErrCheck_(cudaError_t stat, const char *file, int line) {
@@ -177,17 +177,17 @@ __global__ void compute_gemm(const half *A, const half *B, const float *C,
     // memory.
     const size_t gmem_idx =
         (block_tile_i + warpId) * M * GLOBAL_MEM_STRIDE + block_tile_j * N;
-    const float *src_gmem_warp_stream_ptr = &C[gmem_idx];
+    // const float *src_gmem_warp_stream_ptr = &C[gmem_idx];
 
     // Stream multiple C tiles to shared memory.
-#pragma unroll
-    for (int i = 0; i < K; i++) {
-      typedef int4 copy_t;
+// #pragma unroll
+//     for (int i = 0; i < K; i++) {
+//       typedef int4 copy_t;
 
-      *((copy_t *)(shmem_warp_stream_ptr + SHMEM_STRIDE * i) + laneId) =
-          *((copy_t *)(src_gmem_warp_stream_ptr + GLOBAL_MEM_STRIDE * i) +
-            laneId);
-    }
+//       *((copy_t *)(shmem_warp_stream_ptr + SHMEM_STRIDE * i) + laneId) =
+//           *((copy_t *)(src_gmem_warp_stream_ptr + GLOBAL_MEM_STRIDE * i) +
+//             laneId);
+//     }
 
     __syncthreads();
 
@@ -197,16 +197,16 @@ __global__ void compute_gemm(const half *A, const half *B, const float *C,
                                                        [WARP_ROW_TILES];
 
     // Load the C matrix tiles into fragments from shared memory.
-#pragma unroll
-    for (int i = 0; i < WARP_COL_TILES; i++) {
-#pragma unroll
-      for (int j = 0; j < WARP_ROW_TILES; j++) {
-        const float *tile_ptr =
-            shmem_warp_tile_ptr + i * SHMEM_STRIDE * K + j * N;
+// #pragma unroll
+//     for (int i = 0; i < WARP_COL_TILES; i++) {
+// #pragma unroll
+//       for (int j = 0; j < WARP_ROW_TILES; j++) {
+//         const float *tile_ptr =
+//             shmem_warp_tile_ptr + i * SHMEM_STRIDE * K + j * N;
 
-        wmma::load_matrix_sync(c[i][j], tile_ptr, SHMEM_STRIDE, C_LAYOUT);
-      }
-    }
+//         wmma::load_matrix_sync(c[i][j], tile_ptr, SHMEM_STRIDE, C_LAYOUT);
+//       }
+//     }
 
     __syncthreads();
 
@@ -217,7 +217,8 @@ __global__ void compute_gemm(const half *A, const half *B, const float *C,
       for (int j = 0; j < WARP_ROW_TILES; j++) {
 #pragma unroll
         for (int t = 0; t < c[i][j].num_elements; t++) {
-          c[i][j].x[t] *= beta;
+			// c[i][j].x[t] *= beta;
+			c[i][j].x[t] = 0;
         }
       }
     }
