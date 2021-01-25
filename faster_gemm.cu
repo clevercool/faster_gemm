@@ -698,7 +698,7 @@ int main(int argc, char **argv) {
 		cublasErrCheck(cublasGemmEx(cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N, 
 					N_GLOBAL, M_GLOBAL, K_GLOBAL, 
 					&alpha_g,
-					ori_wmma_B, CUDA_R_16F, N_GLOBAL,
+					ori_wmma_B, CUDA_R_16F, K_GLOBAL,
 					ori_wmma_A, CUDA_R_16F, K_GLOBAL,
 					&beta_g, 
 					cublas_wmma_C, CUDA_R_32F, N_GLOBAL,
