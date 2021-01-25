@@ -105,6 +105,22 @@ void curandErrCheck_(curandStatus_t stat, const char *file, int line) {
 }
 
 
+__host__ void init_host_matrices(float *a, float *b, 
+	int M_GLOBAL, int N_GLOBAL, int K_GLOBAL) {
+	for (int i = 0; i < M_GLOBAL; i++) {
+		for (int j = 0; j < K_GLOBAL; j++) {
+			a[i * K_GLOBAL + j] = (float)(rand() % 3);
+		}
+	}
+
+	for (int i = 0; i < N_GLOBAL; i++) {
+		for (int j = 0; j < K_GLOBAL; j++) {
+			b[i * K_GLOBAL + j] = (float)(rand() % 3);
+		}
+	}
+}
+		
+
 #define checkKernelErrors(expr)                             \
   do {                                                      \
     expr;                                                   \
@@ -529,7 +545,7 @@ __global__ void pers_tzgemm(const half *A, const half *B, float *C,
 __global__ void convertFp32ToFp16 (half *out, float *in, int n) {
    int idx = blockDim.x * blockIdx.x + threadIdx.x;
    if (idx < n) {
-      out[idx] = in[idx];
+      out[idx] = (half) in[idx];
    }
 }
 
@@ -578,6 +594,9 @@ int main(int argc, char **argv) {
 
 	float *ori_host_A = NULL;
 	float *ori_host_B = NULL;
+	float *ori_device_A = NULL;
+	float *ori_device_B = NULL;
+
 	float *ori_result_C = NULL;
 	float *cublas_result_C = NULL;
 
@@ -586,14 +605,19 @@ int main(int argc, char **argv) {
 	float *ori_wmma_C = NULL;
 	float *cublas_wmma_C = NULL;
 
-	// ori_host_A = (float *)malloc(sizeof(float) * M_GLOBAL * K_GLOBAL);
-	// ori_host_B = (float *)malloc(sizeof(float) * K_GLOBAL * N_GLOBAL);
+	ori_host_A = (float *)malloc(sizeof(float) * M_GLOBAL * K_GLOBAL);
+	ori_host_B = (float *)malloc(sizeof(float) * K_GLOBAL * N_GLOBAL);
 	ori_result_C = (float *)malloc(sizeof(float) * M_GLOBAL * N_GLOBAL);
 	cublas_result_C = (float *)malloc(sizeof(float) * M_GLOBAL * N_GLOBAL);
 
-	// init_host_matrices(ori_host_A, ori_host_B, M_GLOBAL, N_GLOBAL, K_GLOBAL);
-	cudaErrCheck(cudaMalloc(reinterpret_cast<void **>(&ori_host_A), sizeof(half) * M_GLOBAL * K_GLOBAL));
-	cudaErrCheck(cudaMalloc(reinterpret_cast<void **>(&ori_host_B), sizeof(half) * N_GLOBAL * K_GLOBAL));
+	init_host_matrices(ori_host_A, ori_host_B, M_GLOBAL, N_GLOBAL, K_GLOBAL);
+
+	cudaErrCheck(cudaMalloc(reinterpret_cast<void **>(&ori_device_A), sizeof(float) * M_GLOBAL * K_GLOBAL));
+	cudaErrCheck(cudaMalloc(reinterpret_cast<void **>(&ori_device_B), sizeof(float) * N_GLOBAL * K_GLOBAL));
+	cudaErrCheck(cudaMemcpy(ori_device_A, ori_host_A, sizeof(float) * M_GLOBAL * K_GLOBAL, cudaMemcpyHostToDevice));
+	cudaErrCheck(cudaMemcpy(ori_device_B, ori_host_B, sizeof(float) * N_GLOBAL * K_GLOBAL, cudaMemcpyHostToDevice));
+
+
 	cudaErrCheck(cudaMalloc(reinterpret_cast<void **>(&ori_wmma_A), sizeof(half) * M_GLOBAL * K_GLOBAL));
 	cudaErrCheck(cudaMalloc(reinterpret_cast<void **>(&ori_wmma_B), sizeof(half) * N_GLOBAL * K_GLOBAL));
 	cudaErrCheck(cudaMalloc(reinterpret_cast<void **>(&ori_wmma_C), sizeof(float) * M_GLOBAL * N_GLOBAL));
@@ -605,15 +629,14 @@ int main(int argc, char **argv) {
 	assert(((unsigned long long)cublas_wmma_C) % 128 == 0);
 
 	// printf("Preparing data for GPU...\n");
-	curandGenerator_t gen;
-    curandErrCheck(curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT));
-    curandErrCheck(curandSetPseudoRandomGeneratorSeed(gen, 1337ULL));
-	curandErrCheck(curandGenerateUniform(gen, ori_host_A, M_GLOBAL * K_GLOBAL));
-    curandErrCheck(curandGenerateUniform(gen, ori_host_B, N_GLOBAL * K_GLOBAL));
-	checkKernelErrors((convertFp32ToFp16 <<< (M_GLOBAL * K_GLOBAL + 255) / 256, 256 >>> (ori_wmma_A, ori_host_A, M_GLOBAL * K_GLOBAL)));
-    checkKernelErrors((convertFp32ToFp16 <<< (N_GLOBAL * K_GLOBAL + 255) / 256, 256 >>> (ori_wmma_B, ori_host_B, N_GLOBAL * K_GLOBAL)));
-	// cudaErrCheck(cudaMemcpy(ori_wmma_A, ori_host_A, sizeof(half) * M_GLOBAL * K_GLOBAL, cudaMemcpyHostToDevice));
-	// cudaErrCheck(cudaMemcpy(ori_wmma_B, ori_host_B, sizeof(half) * N_GLOBAL * K_GLOBAL, cudaMemcpyHostToDevice));
+	// curandGenerator_t gen;
+    // curandErrCheck(curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT));
+    // curandErrCheck(curandSetPseudoRandomGeneratorSeed(gen, 1337ULL));
+	// curandErrCheck(curandGenerateUniform(gen, ori_host_A, M_GLOBAL * K_GLOBAL));
+    // curandErrCheck(curandGenerateUniform(gen, ori_host_B, N_GLOBAL * K_GLOBAL));
+	checkKernelErrors((convertFp32ToFp16 <<< (M_GLOBAL * K_GLOBAL + 127) / 128, 128 >>> (ori_wmma_A, ori_device_A, M_GLOBAL * K_GLOBAL)));
+	checkKernelErrors((convertFp32ToFp16 <<< (N_GLOBAL * K_GLOBAL + 127) / 128, 128 >>> (ori_wmma_B, ori_device_B, N_GLOBAL * K_GLOBAL)));
+	
 	cudaErrCheck(cudaMemset(ori_wmma_C, 0, sizeof(float) * M_GLOBAL * N_GLOBAL));
 	cudaErrCheck(cudaMemset(cublas_wmma_C, 0, sizeof(float) * M_GLOBAL * N_GLOBAL));
 
