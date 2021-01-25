@@ -2,6 +2,7 @@
 #include <cuda.h>
 #include <mma.h>
 #include <stdio.h>
+#include <curand.h>
 #include <cublas_v2.h>
 
 // helper functions and utilities to work with CUDA
@@ -13,11 +14,9 @@
 #define WARP_SIZE 32
 
 // MMA matrix tile dimensions.
-
-
-#define M 16
-#define N 16
-#define K 16
+#define WMMA_M 16
+#define WMMA_N 16
+#define WMMA_K 16
 
 #define WMMA_M 16
 #define WMMA_N 16
@@ -98,6 +97,14 @@ void cublasErrCheck_(cublasStatus_t stat, const char *file, int line) {
    }
 }
 
+#define curandErrCheck(stat) { curandErrCheck_((stat), __FILE__, __LINE__); }
+void curandErrCheck_(curandStatus_t stat, const char *file, int line) {
+   if (stat != CURAND_STATUS_SUCCESS) {
+      fprintf(stderr, "cuRand Error: %d %s %d\n", stat, file, line);
+   }
+}
+
+
 #define checkKernelErrors(expr)                             \
   do {                                                      \
     expr;                                                   \
@@ -111,228 +118,225 @@ void cublasErrCheck_(cublasStatus_t stat, const char *file, int line) {
   } while (0)
 
 using namespace nvcuda;
-
-
-__host__ void init_host_matrices(half *a, half *b, 
-	int M_GLOBAL, int N_GLOBAL, int K_GLOBAL) {
-	for (int i = 0; i < M_GLOBAL; i++) {
-		for (int j = 0; j < K_GLOBAL; j++) {
-			a[i * K_GLOBAL + j] = (half)(rand() % 3);
-		}
-	}
-
-	for (int i = 0; i < N_GLOBAL; i++) {
-		for (int j = 0; j < K_GLOBAL; j++) {
-			b[i * K_GLOBAL + j] = (half)(rand() % 3);
-		}
-	}
-}
 		
 
-__global__ void compute_gemm(const half *A, const half *B, const float *C,
-							 float *D, float alpha, float beta, int M_GLOBAL, int N_GLOBAL, int K_GLOBAL) {
-  extern __shared__ half shmem[][CHUNK_K * K + SKEW_HALF];
+__global__ void compute_gemm(const half *A, const half *B,
+							 float *D, int M_GLOBAL, int N_GLOBAL, int K_GLOBAL, int iteration) {
+	extern __shared__ half shmem[][CHUNK_K * WMMA_K + SKEW_HALF];
+	// __shared__ half shmem[BLOCK_COL_TILES * WMMA_M * 2][CHUNK_K * WMMA_K + SKEW_HALF];
 
-  const unsigned int N_TILES = N_GLOBAL / N;
-  const unsigned int K_TILES = K_GLOBAL / K;
-  const unsigned int M_TILES = M_GLOBAL / M;
+	const unsigned int N_TILES = N_GLOBAL / WMMA_N;
+	const unsigned int K_TILES = K_GLOBAL / WMMA_K;
+	const unsigned int M_TILES = M_GLOBAL / WMMA_M;
 
-  // Warp and lane identification.
-  const unsigned int warpId = threadIdx.x / WARP_SIZE;
-  const unsigned int laneId = threadIdx.x % WARP_SIZE;
+	// Warp and lane identification.
+	const unsigned int warpId = threadIdx.x / WARP_SIZE;
+	const unsigned int laneId = threadIdx.x % WARP_SIZE;
 
-  // Offset in shared memory from which the B matrix is stored.
-  const size_t shmem_idx_b_off = BLOCK_COL_TILES * M;
+	// Offset in shared memory from which the B matrix is stored.
+	const size_t shmem_idx_b_off = BLOCK_COL_TILES * WMMA_M;
 
-  // This pointer is used to access the C and D matrix tiles this warp computes.
-  float *shmem_warp_tile_ptr = (float *)&shmem[0][0] +
-                               (warpId / 2) * SHMEM_STRIDE * K * 2 +
-                               (warpId % 2) * SHMEM_OFFSET;
+	// This pointer is used to access the C and D matrix tiles this warp computes.
+	float *shmem_warp_tile_ptr = (float *)&shmem[0][0] +
+								(warpId / 2) * SHMEM_STRIDE * WMMA_K * 2 +
+								(warpId % 2) * SHMEM_OFFSET;
 
-  // This pointer is used to stream the C and D matrices block-wide tile to and
-  // from shared memory.
-  float *shmem_warp_stream_ptr =
-      (float *)&shmem[0][0] + warpId * SHMEM_STRIDE * K;
+	// This pointer is used to stream the C and D matrices block-wide tile to and
+	// from shared memory.
+	float *shmem_warp_stream_ptr =
+		(float *)&shmem[0][0] + warpId * SHMEM_STRIDE * WMMA_K;
 
-  // Adjust the beta scaler, as it'll be multiplied by alpha at the end of
-  // each tile computation. Technically this is not generally correct (may
-  // result in a loss of precision). Zero still needs to be specially handled
-  // though.
-  beta /= alpha;
+	// Adjust the beta scaler, as it'll be multiplied by alpha at the end of
+	// each tile computation. Technically this is not generally correct (may
+	// result in a loss of precision). Zero still needs to be specially handled
+	// though.
+	// beta /= alpha;
+	float alpha = alpha_g;
 
-  // Each CTA slides along the 128 x 128 tiles from the top left corner of the
-  // matrix to the right and down, and selects the next tile to compute. Once
-  // there's no such tile, all warps in this CTA exit.
-  for (unsigned int block_pos = blockIdx.x;; block_pos += gridDim.x) {
-    const unsigned int block_tile_i =
-        ((block_pos * BLOCK_ROW_TILES) / N_TILES) * (BLOCK_COL_TILES);
-    const unsigned int block_tile_j = (block_pos * BLOCK_COL_TILES) % N_TILES;
+	// Each CTA slides along the 128 x 128 tiles from the top left corner of the
+	// matrix to the right and down, and selects the next tile to compute. Once
+	// there's no such tile, all warps in this CTA exit.
+	for (unsigned int block_pos = blockIdx.x;; block_pos += gridDim.x) {
 
-    // Stop when there are no more D matrix tiles to compute in this CTA.
-    if (block_tile_i >= M_TILES) {
-      break;
-    }
+		const unsigned int block_tile_i =
+			((block_pos * BLOCK_ROW_TILES) / N_TILES) * (BLOCK_COL_TILES);
+		const unsigned int block_tile_j = (block_pos * BLOCK_COL_TILES) % N_TILES;
 
-    // This warp's pointer to the C matrix data to copy memory from to shared
-    // memory.
-    const size_t gmem_idx =
-        (block_tile_i + warpId) * M * GLOBAL_MEM_STRIDE + block_tile_j * N;
-    // const float *src_gmem_warp_stream_ptr = &C[gmem_idx];
+		// Stop when there are no more D matrix tiles to compute in this CTA.
+		if (block_tile_i >= M_TILES) {
+			break;
+		}
 
-    // Stream multiple C tiles to shared memory.
-// #pragma unroll
-//     for (int i = 0; i < K; i++) {
-//       typedef int4 copy_t;
+		// This warp's pointer to the C matrix data to copy memory from to shared
+		// memory.
+		const size_t gmem_idx =
+			(block_tile_i + warpId) * WMMA_M * GLOBAL_MEM_STRIDE + block_tile_j * WMMA_N;
+		// const float *src_gmem_warp_stream_ptr = &C[gmem_idx];
 
-//       *((copy_t *)(shmem_warp_stream_ptr + SHMEM_STRIDE * i) + laneId) =
-//           *((copy_t *)(src_gmem_warp_stream_ptr + GLOBAL_MEM_STRIDE * i) +
-//             laneId);
-//     }
+		// Stream multiple C tiles to shared memory.
+		// #pragma unroll
+		//     for (int i = 0; i < WMMA_K; i++) {
+		//       typedef int4 copy_t;
 
-    __syncthreads();
+		//       *((copy_t *)(shmem_warp_stream_ptr + SHMEM_STRIDE * i) + laneId) =
+		//           *((copy_t *)(src_gmem_warp_stream_ptr + GLOBAL_MEM_STRIDE * i) +
+		//             laneId);
+		//     }
 
-    // These fragments will accumulate the result of A and B matrix fragment
-    // multiplications along the K_GLOBAL dimension.
-    wmma::fragment<wmma::accumulator, M, N, K, float> c[WARP_COL_TILES]
-                                                       [WARP_ROW_TILES];
+		// __syncthreads();
 
-    // Load the C matrix tiles into fragments from shared memory.
-// #pragma unroll
-//     for (int i = 0; i < WARP_COL_TILES; i++) {
-// #pragma unroll
-//       for (int j = 0; j < WARP_ROW_TILES; j++) {
-//         const float *tile_ptr =
-//             shmem_warp_tile_ptr + i * SHMEM_STRIDE * K + j * N;
+		for (int loop = 0; loop < iteration; loop++) {
 
-//         wmma::load_matrix_sync(c[i][j], tile_ptr, SHMEM_STRIDE, C_LAYOUT);
-//       }
-//     }
+			// These fragments will accumulate the result of A and B matrix fragment
+			// multiplications along the K_GLOBAL dimension.
+			wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c[WARP_COL_TILES]
+																[WARP_ROW_TILES];
 
-    __syncthreads();
+			// Load the C matrix tiles into fragments from shared memory.
+			// #pragma unroll
+			//     for (int i = 0; i < WARP_COL_TILES; i++) {
+			// #pragma unroll
+			//       for (int j = 0; j < WARP_ROW_TILES; j++) {
+			//         const float *tile_ptr =
+			//             shmem_warp_tile_ptr + i * SHMEM_STRIDE * WMMA_K + j * WMMA_N;
 
-    // Scale the C matrix.
-#pragma unroll
-    for (int i = 0; i < WARP_COL_TILES; i++) {
-#pragma unroll
-      for (int j = 0; j < WARP_ROW_TILES; j++) {
-#pragma unroll
-        for (int t = 0; t < c[i][j].num_elements; t++) {
-			// c[i][j].x[t] *= beta;
-			c[i][j].x[t] = 0;
-        }
-      }
-    }
+			//         wmma::load_matrix_sync(c[i][j], tile_ptr, SHMEM_STRIDE, C_LAYOUT);
+			//       }
+			//     }
 
-    // Select what warp copies what matrix to shared memory.
-    // Warps 0-3 copy the A matrix, warps 4-7 copy the B matrix.
-    const half *warp_ptr = (warpId < 4) ? (&A[block_tile_i * M * K_GLOBAL] +
-                                           M * K_GLOBAL * (warpId % 4) * 2)
-                                        : (&B[block_tile_j * N * K_GLOBAL] +
-                                           N * K_GLOBAL * (warpId % 4) * 2);
+			#pragma unroll
+			for (int i = 0; i < WARP_COL_TILES; i++) {
+				#pragma unroll
+				for (int j = 0; j < WARP_ROW_TILES; j++) {
+					wmma::fill_fragment(c[i][j], 0.0f);
+				}
+			}
+			// __syncthreads();
 
-    // Go through the global K dimension by a fixed step at a time.
-#pragma unroll
-    for (int tile_k = 0; tile_k < K_TILES; tile_k += CHUNK_K) {
-      // Copy slices of the A and B matrices to shared memory.
-      // The first half of the warps in the CTA copy the A matrix, the rest copy
-      // the B matrix.
-      size_t shmem_idx =
-          warpId < (WARPS_PER_BLOCK / 2)
-              ? (M * (warpId % (WARPS_PER_BLOCK / 2)) * 2)
-              : (N * (warpId % (WARPS_PER_BLOCK / 2)) * 2 + shmem_idx_b_off);
+			// // Scale the C matrix.
+			// #pragma unroll
+			// for (int i = 0; i < WARP_COL_TILES; i++) {
+			// 	#pragma unroll
+			// 	for (int j = 0; j < WARP_ROW_TILES; j++) {
+			// 		#pragma unroll
+			// 		for (int t = 0; t < c[i][j].num_elements; t++) {
+			// 			// c[i][j].x[t] *= beta;
+			// 			c[i][j].x[t] = 0;
+			// 		}
+			// 	}
+			// }
 
-      // First half of the warp copies the first row / column of the matrix,
-      // the second half of the warp copies the next.
-      int4 *lane_ptr = (int4 *)(warp_ptr + tile_k * K +
-                                (laneId / CHUNK_COPY_LINE_LANES) * K_GLOBAL) +
-                       (laneId % CHUNK_COPY_LINE_LANES);
+			// Select what warp copies what matrix to shared memory.
+			// Warps 0-3 copy the A matrix, warps 4-7 copy the B matrix.
+			const half *warp_ptr = (warpId < (WARPS_PER_BLOCK / 2)) ? (&A[block_tile_i * WMMA_M * K_GLOBAL] +
+													WMMA_M * K_GLOBAL * (warpId % (WARPS_PER_BLOCK / 2)) * 2)
+												: (&B[block_tile_j * WMMA_N * K_GLOBAL] +
+													WMMA_N * K_GLOBAL * (warpId % (WARPS_PER_BLOCK / 2)) * 2);
 
-      // Shift the second half of the warp to the next row / column in the
-      // shared memory.
-      shmem_idx += laneId / CHUNK_COPY_LINE_LANES;
+			// Go through the global WMMA_K dimension by a fixed step at a time.
+			#pragma unroll
+			for (int tile_k = 0; tile_k < K_TILES; tile_k += CHUNK_K) {
+				// Copy slices of the A and B matrices to shared memory.
+				// The first half of the warps in the CTA copy the A matrix, the rest copy
+				// the B matrix.
+				size_t shmem_idx =
+					warpId < (WARPS_PER_BLOCK / 2)
+						? (WMMA_M * (warpId % (WARPS_PER_BLOCK / 2)) * 2)
+						: (WMMA_N * (warpId % (WARPS_PER_BLOCK / 2)) * 2 + shmem_idx_b_off);
 
-#pragma unroll
-      for (int i = 0; i < ((WARP_SIZE / 2) / CHUNK_COPY_LINES_PER_WARP) * 2;
-           i++) {
-        // Copy 16 bytes at once in each lane.
-        *((int4 *)&shmem[shmem_idx][0] + (laneId % CHUNK_COPY_LINE_LANES)) =
-            *lane_ptr;
+				// First half of the warp copies the first row / column of the matrix,
+				// the second half of the warp copies the next.
+				int4 *lane_ptr = (int4 *)(warp_ptr + tile_k * WMMA_K +
+										(laneId / CHUNK_COPY_LINE_LANES) * K_GLOBAL) +
+								(laneId % CHUNK_COPY_LINE_LANES);
 
-        // Advance the global memory pointer and the shared memory index.
-        lane_ptr =
-            (int4 *)((half *)lane_ptr + K_GLOBAL * CHUNK_COPY_LINES_PER_WARP);
-        shmem_idx += CHUNK_COPY_LINES_PER_WARP;
-      }
+				// Shift the second half of the warp to the next row / column in the
+				// shared memory.
+				shmem_idx += laneId / CHUNK_COPY_LINE_LANES;
 
-      __syncthreads();
+				#pragma unroll
+				for (int i = 0; i < ((WARP_SIZE / 2) / CHUNK_COPY_LINES_PER_WARP) * 2;
+				i++) {
+					// Copy 16 bytes at once in each lane.
+					*((int4 *)&shmem[shmem_idx][0] + (laneId % CHUNK_COPY_LINE_LANES)) =
+					*lane_ptr;
 
-      // Compute a grid of C matrix tiles in each warp.
-#pragma unroll
-      for (int k_step = 0; k_step < CHUNK_K; k_step++) {
-        wmma::fragment<wmma::matrix_a, M, N, K, half, wmma::row_major>
-            a[WARP_COL_TILES];
-        wmma::fragment<wmma::matrix_b, M, N, K, half, wmma::col_major>
-            b[WARP_ROW_TILES];
+					// Advance the global memory pointer and the shared memory index.
+					lane_ptr =
+						(int4 *)((half *)lane_ptr + K_GLOBAL * CHUNK_COPY_LINES_PER_WARP);
+						shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+				}
 
-#pragma unroll
-        for (int i = 0; i < WARP_COL_TILES; i++) {
-          size_t shmem_idx_a = (warpId / 2) * M * 2 + (i * M);
-          const half *tile_ptr = &shmem[shmem_idx_a][k_step * K];
+				__syncthreads();
 
-          wmma::load_matrix_sync(a[i], tile_ptr, K * CHUNK_K + SKEW_HALF);
+				// Compute a grid of C matrix tiles in each warp.
+				#pragma unroll
+				for (int k_step = 0; k_step < CHUNK_K; k_step++) {
+					wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major>
+						a[WARP_COL_TILES];
+					wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major>
+						b[WARP_ROW_TILES];
 
-#pragma unroll
-          for (int j = 0; j < WARP_ROW_TILES; j++) {
-            if (i == 0) {
-              // Load the B matrix fragment once, because it is going to be
-              // reused against the other A matrix fragments.
-              size_t shmem_idx_b = shmem_idx_b_off +
-                                   (WARP_ROW_TILES * N) * (warpId % 2) +
-                                   (j * N);
-              const half *tile_ptr = &shmem[shmem_idx_b][k_step * K];
+					#pragma unroll
+					for (int i = 0; i < WARP_COL_TILES; i++) {
+						size_t shmem_idx_a = (warpId / 2) * WMMA_M * 2 + (i * WMMA_M);
+						const half *tile_ptr = &shmem[shmem_idx_a][k_step * WMMA_K];
 
-              wmma::load_matrix_sync(b[j], tile_ptr, K * CHUNK_K + SKEW_HALF);
-            }
+						wmma::load_matrix_sync(a[i], tile_ptr, WMMA_K * CHUNK_K + SKEW_HALF);
 
-            wmma::mma_sync(c[i][j], a[i], b[j], c[i][j]);
-          }
-        }
-      }
+						#pragma unroll
+						for (int j = 0; j < WARP_ROW_TILES; j++) {
+							if (i == 0) {
+								// Load the B matrix fragment once, because it is going to be
+								// reused against the other A matrix fragments.
+								size_t shmem_idx_b = shmem_idx_b_off +
+													(WARP_ROW_TILES * WMMA_N) * (warpId % 2) +
+													(j * WMMA_N);
+								const half *tile_ptr = &shmem[shmem_idx_b][k_step * WMMA_K];
 
-      __syncthreads();
-    }
+								wmma::load_matrix_sync(b[j], tile_ptr, WMMA_K * CHUNK_K + SKEW_HALF);
+							}
 
-      // Store the D fragments to shared memory.
-#pragma unroll
-    for (int i = 0; i < WARP_COL_TILES; i++) {
-#pragma unroll
-      for (int j = 0; j < WARP_ROW_TILES; j++) {
-#pragma unroll
-        // Uniform, point-wise transformations of ALL fragment elements by ALL
-        // threads in the warp are well-defined even though element indices
-        // within fragment storage are not defined.
-        for (int t = 0; t < c[i][j].num_elements; t++) c[i][j].x[t] *= alpha;
+							wmma::mma_sync(c[i][j], a[i], b[j], c[i][j]);
+						}
+					}
+				}
 
-        float *tile_ptr = shmem_warp_tile_ptr + i * SHMEM_STRIDE * K + j * N;
+				__syncthreads();
+			}
 
-        wmma::store_matrix_sync(tile_ptr, c[i][j], SHMEM_STRIDE, C_LAYOUT);
-      }
-    }
+			// Store the D fragments to shared memory.
+			#pragma unroll
+			for (int i = 0; i < WARP_COL_TILES; i++) {
+				#pragma unroll
+				for (int j = 0; j < WARP_ROW_TILES; j++) {
+					#pragma unroll
+					// Uniform, point-wise transformations of ALL fragment elements by ALL
+					// threads in the warp are well-defined even though element indices
+					// within fragment storage are not defined.
+					for (int t = 0; t < c[i][j].num_elements; t++) c[i][j].x[t] *= alpha;
 
-    __syncthreads();
+					float *tile_ptr = shmem_warp_tile_ptr + i * SHMEM_STRIDE * WMMA_K + j * WMMA_N;
 
-    // Now that shared memory contains all the D tiles, stream them to global
-    // memory.
-    float *dst_gmem_warp_stream_ptr = &D[gmem_idx];
+					wmma::store_matrix_sync(tile_ptr, c[i][j], SHMEM_STRIDE, C_LAYOUT);
+				}
+			}
 
-#pragma unroll
-    for (int i = 0; i < K; i++) {
-      *((int4 *)(dst_gmem_warp_stream_ptr + GLOBAL_MEM_STRIDE * i) + laneId) =
-          *((int4 *)(shmem_warp_stream_ptr + SHMEM_STRIDE * i) + laneId);
-    }
+			__syncthreads();
 
-    __syncthreads();
-  }
+			// Now that shared memory contains all the D tiles, stream them to global
+			// memory.
+			float *dst_gmem_warp_stream_ptr = &D[gmem_idx];
+
+			#pragma unroll
+			for (int i = 0; i < WMMA_K; i++) {
+				*((int4 *)(dst_gmem_warp_stream_ptr + GLOBAL_MEM_STRIDE * i) + laneId) =
+					*((int4 *)(shmem_warp_stream_ptr + SHMEM_STRIDE * i) + laneId);
+			}
+
+			__syncthreads();
+		}
+	}
 }
 
 
@@ -427,7 +431,7 @@ __global__ void pers_tzgemm(const half *A, const half *B, float *C,
 					? (&A[block_tile_i * WMMA_M * K_GLOBAL] + WMMA_M * K_GLOBAL * (warpId % (WARPS_PER_BLOCK / 2)) * 2)
 					: (&B[block_tile_j * WMMA_N * K_GLOBAL] + WMMA_N * K_GLOBAL * (warpId % (WARPS_PER_BLOCK / 2)) * 2);
 
-			// Go through the global K dimension by a fixed step at a time.
+			// Go through the global WMMA_K dimension by a fixed step at a time.
 			#pragma unroll
 			for (int tile_k = 0; tile_k < K_TILES; tile_k += CHUNK_K) {
 				// Copy slices of the A and B matrices to shared memory.
@@ -522,26 +526,32 @@ __global__ void pers_tzgemm(const half *A, const half *B, float *C,
 }
 
 
+__global__ void convertFp32ToFp16 (half *out, float *in, int n) {
+   int idx = blockDim.x * blockIdx.x + threadIdx.x;
+   if (idx < n) {
+      out[idx] = in[idx];
+   }
+}
+
+
 int main(int argc, char **argv) {
-	int tzgemm_block_t = 0;
+	int tzgemm_blks = 0;
     int tzgemm_iter = 0;
 	int M_INPUT = 0;
 	int N_INPUT = 0;
 	int K_INPUT = 0;
     if (argc == 6) {
-        tzgemm_block_t = atoi(argv[1]);
+        tzgemm_blks = atoi(argv[1]);
         tzgemm_iter = atoi(argv[2]);
         M_INPUT = atoi(argv[3]);
         N_INPUT = atoi(argv[4]);
         K_INPUT = atoi(argv[5]);
     } else {
-        tzgemm_block_t = 2;
+        tzgemm_blks = 2;
         tzgemm_iter = 1000;
 		M_INPUT = 256;
 		N_INPUT = 256;
 		K_INPUT = 256;
-		// tzgemm_block_t = 2;
-        // tzgemm_iter = 4000;
     }
 
 	cudaDeviceProp deviceProp;
@@ -554,9 +564,9 @@ int main(int argc, char **argv) {
 	// int N_GLOBAL = WMMA_N * N_TILES;
 	// int K_GLOBAL = WMMA_K * K_TILES;
 
-	int M_GLOBAL = (M_INPUT < 64) ? 64 : (M_INPUT / 64) * 64;
-	int N_GLOBAL = (N_INPUT < 64) ? 64 : (N_INPUT / 64) * 64;
-	int K_GLOBAL = (K_INPUT < 64) ? 64 : (K_INPUT / 64) * 64;
+	int M_GLOBAL = (M_INPUT < 128) ? 128 : (M_INPUT / 128) * 128;
+	int N_GLOBAL = (N_INPUT < 128) ? 128 : (N_INPUT / 128) * 128;
+	int K_GLOBAL = (K_INPUT < 128) ? 128 : (K_INPUT / 128) * 128;
 
 	int M_TILES = M_GLOBAL / WMMA_M;
 	int N_TILES = N_GLOBAL / WMMA_N;
@@ -566,8 +576,8 @@ int main(int argc, char **argv) {
 	printf("N_ORI: %5d N_GLOBAL: %5d (%d x %d) \n", N_INPUT, N_GLOBAL, WMMA_N, N_TILES);
 	printf("K_ORI: %5d K_GLOBAL: %5d (%d x %d) \n", K_INPUT, K_GLOBAL, WMMA_K, K_TILES);
 
-	half *ori_host_A = NULL;
-	half *ori_host_B = NULL;
+	float *ori_host_A = NULL;
+	float *ori_host_B = NULL;
 	float *ori_result_C = NULL;
 	float *cublas_result_C = NULL;
 
@@ -576,13 +586,14 @@ int main(int argc, char **argv) {
 	float *ori_wmma_C = NULL;
 	float *cublas_wmma_C = NULL;
 
-	ori_host_A = (half *)malloc(sizeof(half) * M_GLOBAL * K_GLOBAL);
-	ori_host_B = (half *)malloc(sizeof(half) * K_GLOBAL * N_GLOBAL);
+	// ori_host_A = (float *)malloc(sizeof(float) * M_GLOBAL * K_GLOBAL);
+	// ori_host_B = (float *)malloc(sizeof(float) * K_GLOBAL * N_GLOBAL);
 	ori_result_C = (float *)malloc(sizeof(float) * M_GLOBAL * N_GLOBAL);
 	cublas_result_C = (float *)malloc(sizeof(float) * M_GLOBAL * N_GLOBAL);
 
-	init_host_matrices(ori_host_A, ori_host_B, M_GLOBAL, N_GLOBAL, K_GLOBAL);
-
+	// init_host_matrices(ori_host_A, ori_host_B, M_GLOBAL, N_GLOBAL, K_GLOBAL);
+	cudaErrCheck(cudaMalloc(reinterpret_cast<void **>(&ori_host_A), sizeof(half) * M_GLOBAL * K_GLOBAL));
+	cudaErrCheck(cudaMalloc(reinterpret_cast<void **>(&ori_host_B), sizeof(half) * N_GLOBAL * K_GLOBAL));
 	cudaErrCheck(cudaMalloc(reinterpret_cast<void **>(&ori_wmma_A), sizeof(half) * M_GLOBAL * K_GLOBAL));
 	cudaErrCheck(cudaMalloc(reinterpret_cast<void **>(&ori_wmma_B), sizeof(half) * N_GLOBAL * K_GLOBAL));
 	cudaErrCheck(cudaMalloc(reinterpret_cast<void **>(&ori_wmma_C), sizeof(float) * M_GLOBAL * N_GLOBAL));
@@ -594,8 +605,15 @@ int main(int argc, char **argv) {
 	assert(((unsigned long long)cublas_wmma_C) % 128 == 0);
 
 	// printf("Preparing data for GPU...\n");
-	cudaErrCheck(cudaMemcpy(ori_wmma_A, ori_host_A, sizeof(half) * M_GLOBAL * K_GLOBAL, cudaMemcpyHostToDevice));
-	cudaErrCheck(cudaMemcpy(ori_wmma_B, ori_host_B, sizeof(half) * N_GLOBAL * K_GLOBAL, cudaMemcpyHostToDevice));
+	curandGenerator_t gen;
+    curandErrCheck(curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT));
+    curandErrCheck(curandSetPseudoRandomGeneratorSeed(gen, 1337ULL));
+	curandErrCheck(curandGenerateUniform(gen, ori_host_A, M_GLOBAL * K_GLOBAL));
+    curandErrCheck(curandGenerateUniform(gen, ori_host_B, N_GLOBAL * K_GLOBAL));
+	checkKernelErrors((convertFp32ToFp16 <<< (M_GLOBAL * K_GLOBAL + 255) / 256, 256 >>> (ori_wmma_A, ori_host_A, M_GLOBAL * K_GLOBAL)));
+    checkKernelErrors((convertFp32ToFp16 <<< (N_GLOBAL * K_GLOBAL + 255) / 256, 256 >>> (ori_wmma_B, ori_host_B, N_GLOBAL * K_GLOBAL)));
+	// cudaErrCheck(cudaMemcpy(ori_wmma_A, ori_host_A, sizeof(half) * M_GLOBAL * K_GLOBAL, cudaMemcpyHostToDevice));
+	// cudaErrCheck(cudaMemcpy(ori_wmma_B, ori_host_B, sizeof(half) * N_GLOBAL * K_GLOBAL, cudaMemcpyHostToDevice));
 	cudaErrCheck(cudaMemset(ori_wmma_C, 0, sizeof(float) * M_GLOBAL * N_GLOBAL));
 	cudaErrCheck(cudaMemset(cublas_wmma_C, 0, sizeof(float) * M_GLOBAL * N_GLOBAL));
 
@@ -616,9 +634,6 @@ int main(int argc, char **argv) {
 	// };
 	// printf("Required shared memory size: %lu Kb\n\n", SHMEM_SZ / 1024UL);
 
-	// const float alpha = 1.1f;
-	// const float beta = 1.2f;
-
 	enum {
 		// Compute the right amount of shared memory to request.
 		// We need shared memory to hold per-CTA C and D matrix tiles, and to cache
@@ -627,10 +642,12 @@ int main(int argc, char **argv) {
 		// maximum of those
 		// two numbers.
 		SHMEM_SZ = MAX(
-			sizeof(half) * (BLOCK_COL_TILES * M) * (CHUNK_K * K + SKEW_HALF) * 2,
-			M * (BLOCK_ROW_WARPS * WARP_ROW_TILES) * N *
+			sizeof(half) * (BLOCK_COL_TILES * WMMA_M) * (CHUNK_K * WMMA_K + SKEW_HALF) * 2,
+			WMMA_M * (BLOCK_ROW_WARPS * WARP_ROW_TILES) * WMMA_N *
 				(BLOCK_COL_WARPS * WARP_COL_TILES) * sizeof(float))
 	  };
+
+	printf("SHMEM_SZ %d \n", SHMEM_SZ);
 
 	float milliseconds = 0;
 	float milliseconds_1 = 0;
@@ -640,7 +657,7 @@ int main(int argc, char **argv) {
 
 	dim3 wmma_grid;
     dim3 wmma_block;
-	wmma_grid.x = 80 * tzgemm_block_t;
+	wmma_grid.x = 80 * tzgemm_blks;
 	wmma_block.x = THREADS_PER_BLOCK;
 	int wmma_grid_dim_x = (M_TILES * N_TILES) / (BLOCK_COL_TILES * BLOCK_ROW_TILES);
 	int wmma_block_dim_x = wmma_block.x;
@@ -657,10 +674,10 @@ int main(int argc, char **argv) {
 	checkCudaErrors(cudaFuncSetAttribute(
 		compute_gemm, cudaFuncAttributeMaxDynamicSharedMemorySize, SHMEM_SZ));
 		
-	for(int i = 0; i < tzgemm_iter; i++)
+	for(int i = 0; i < 1; i++)
 	{
 		checkKernelErrors(
-        (compute_gemm<<<deviceProp.multiProcessorCount, THREADS_PER_BLOCK, SHMEM_SZ>>>(ori_wmma_A, ori_wmma_B, ori_wmma_C, ori_wmma_C, alpha_g, beta_g, M_GLOBAL, N_GLOBAL, K_GLOBAL)));
+        (compute_gemm<<<deviceProp.multiProcessorCount, THREADS_PER_BLOCK, SHMEM_SZ>>>(ori_wmma_A, ori_wmma_B, ori_wmma_C, M_GLOBAL, N_GLOBAL, K_GLOBAL, tzgemm_iter)));
 	}
 
 	cudaErrCheck(cudaEventRecord(stop));
@@ -678,14 +695,14 @@ int main(int argc, char **argv) {
 
 	for(int i = 0; i < tzgemm_iter; i++)
 	{
-	cublasErrCheck(cublasGemmEx(cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N, 
-				N_GLOBAL, M_GLOBAL, K_GLOBAL, 
-				&alpha_g,
-				ori_wmma_B, CUDA_R_16F, N_GLOBAL,
-				ori_wmma_A, CUDA_R_16F, K_GLOBAL,
-				&beta_g, 
-				cublas_wmma_C, CUDA_R_32F, N_GLOBAL,
-				CUDA_R_32F, CUBLAS_GEMM_DFALT_TENSOR_OP));
+		cublasErrCheck(cublasGemmEx(cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N, 
+					N_GLOBAL, M_GLOBAL, K_GLOBAL, 
+					&alpha_g,
+					ori_wmma_B, CUDA_R_16F, N_GLOBAL,
+					ori_wmma_A, CUDA_R_16F, K_GLOBAL,
+					&beta_g, 
+					cublas_wmma_C, CUDA_R_32F, N_GLOBAL,
+					CUDA_R_32F, CUBLAS_GEMM_DFALT_TENSOR_OP));
 	}
 	cudaErrCheck(cudaEventRecord(stop));
 	cudaErrCheck(cudaEventSynchronize(stop));
@@ -704,9 +721,9 @@ int main(int argc, char **argv) {
 		count++;
 		}
 
-		// if (count < 10) {
-		// 	printf("%f %f\n", ori_result_C[i], cublas_result_C[i]);
-		// }
+		if (i < 5) {
+			printf("%f %f\n", ori_result_C[i], cublas_result_C[i]);
+		}
 	}
 
 	if (count > 0) {
@@ -717,8 +734,8 @@ int main(int argc, char **argv) {
 	free(ori_result_C);
 	free(cublas_result_C);
 
-	free(ori_host_A);
-	free(ori_host_B);
+	// free(ori_host_A);
+	// free(ori_host_B);
 	cudaErrCheck(cudaFree(reinterpret_cast<void *>(ori_wmma_A)));
 	cudaErrCheck(cudaFree(reinterpret_cast<void *>(ori_wmma_B)));
 	cudaErrCheck(cudaFree(reinterpret_cast<void *>(ori_wmma_C)));
