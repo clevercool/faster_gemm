@@ -32,8 +32,8 @@
 #define CHUNK_COPY_LINE_LANES (WARP_SIZE / CHUNK_COPY_LINES_PER_WARP)
 
 #define BLOCK_ROW_WARPS 2
-#define BLOCK_COL_WARPS 2
-#define WARP_ROW_TILES 2
+#define BLOCK_COL_WARPS 1
+#define WARP_ROW_TILES 1
 #define WARP_COL_TILES 2
 
 // Implementation constants.
@@ -63,7 +63,8 @@
 #define SKEW_HALF 8
 
 const float alpha_g = 1.1f;
-const float beta_g = 1.2f;
+const float beta_g = 0;
+// const float beta_g = 1.2f;
 
 // __host__ void init_host_matrices(half *a, half *b) {
 // 	for (int i = 0; i < M_GLOBAL; i++) {
@@ -241,8 +242,8 @@ __global__ void pers_tzgemm(half *A, half *B, float *C,
 
 			#pragma unroll
 			for (int i = 0; i < 16; i++) {
-				*((int2 *)(dst_gmem_warp_stream_ptr + GLOBAL_MEM_STRIDE * i) + laneId) =
-					*((int2 *)(shmem_warp_stream_ptr + SHMEM_STRIDE * i) + laneId);
+				*((int *)(dst_gmem_warp_stream_ptr + GLOBAL_MEM_STRIDE * i) + laneId) =
+					*((int *)(shmem_warp_stream_ptr + SHMEM_STRIDE * i) + laneId);
 			}
 			__syncthreads();
 		}

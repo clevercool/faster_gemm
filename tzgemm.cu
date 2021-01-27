@@ -47,19 +47,15 @@ void curandErrCheck_(curandStatus_t stat, const char *file, int line) {
 
 
 int main(int argc, char* argv[]) {
-    int pers_sgemm_block = 2;
-    int sgemm_iter = 66;
-    int wmma_iter = 3600;
+    int wmma_iter = 1;
     int M_INPUT = 16 * 32 * 8;
 	int N_INPUT = 16 * 4 * 48;
 	int K_INPUT = 16 * 4 * 12;
-    if (argc == 7) {
-        pers_sgemm_block = atoi(argv[1]);
-        sgemm_iter = atoi(argv[2]);
-        wmma_iter = atoi(argv[3]);
-        M_INPUT = atoi(argv[4]);
-        N_INPUT = atoi(argv[5]);
-        K_INPUT = atoi(argv[6]);
+    if (argc == 5) {
+        wmma_iter = atoi(argv[1]);
+        M_INPUT = atoi(argv[2]);
+        N_INPUT = atoi(argv[3]);
+        K_INPUT = atoi(argv[4]);
     } 
 
     int M_GLOBAL = (M_INPUT < 64) ? 64 : (M_INPUT / 64) * 64;
@@ -138,7 +134,7 @@ int main(int argc, char* argv[]) {
 
     dim3 wmma_grid;
     dim3 wmma_block;
-	wmma_grid.x = 68 * 2;
+	wmma_grid.x = 68 * 4;
 	wmma_block.x = THREADS_PER_BLOCK;
 	int wmma_grid_dim_x = (M_TILES * N_TILES) / (BLOCK_COL_TILES * BLOCK_ROW_TILES);
 	int wmma_block_dim_x = wmma_block.x;
@@ -146,33 +142,53 @@ int main(int argc, char* argv[]) {
     printf("[ORI] Running with tzgemm...\n");
     printf("[ORI] wmma_grid -- %d * 1 wmma_block -- %d * 1 \n", wmma_grid.x, wmma_block.x);
 
-    cudaErrCheck(cudaEventRecord(startKERNEL));
     checkKernelErrors((pers_tzgemm<<<wmma_grid, wmma_block>>>(ori_wmma_A, ori_wmma_B, ori_wmma_C,
-                            M_GLOBAL, N_GLOBAL, K_GLOBAL,
-							wmma_grid_dim_x, wmma_block_dim_x, wmma_iter)));
+                            64, 64, 64,
+							4, wmma_block_dim_x, 1)));
+	cudaErrCheck(cudaMemset(ori_wmma_C, 0, sizeof(float) * M_GLOBAL * N_GLOBAL));
+
+    cudaErrCheck(cudaEventRecord(startKERNEL));
+    for(int i = 0; i < wmma_iter; i++) {
+        checkKernelErrors((pers_tzgemm<<<wmma_grid, wmma_block>>>(ori_wmma_A, ori_wmma_B, ori_wmma_C,
+                                M_GLOBAL, N_GLOBAL, K_GLOBAL,
+                                wmma_grid_dim_x, wmma_block_dim_x, 1)));
+    }
     cudaErrCheck(cudaEventRecord(stopKERNEL));
     cudaErrCheck(cudaEventSynchronize(stopKERNEL));
     cudaErrCheck(cudaEventElapsedTime(&kernel_time, startKERNEL, stopKERNEL));
-    printf("[ORI] tzgemm took %f ms\n", kernel_time);
+    printf("[ORI] tzgemm took %f us\n", kernel_time * 1000 / wmma_iter);
 
     cublasHandle_t cublasHandle;
 	cublasErrCheck(cublasCreate(&cublasHandle));
 	cublasErrCheck(cublasSetMathMode(cublasHandle, CUBLAS_TENSOR_OP_MATH));
 	printf("Running with cuBLAS...\n");
 
-    cudaErrCheck(cudaEventRecord(startKERNEL));
-	cublasErrCheck(cublasGemmEx(cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N, 
-					N_GLOBAL, M_GLOBAL, K_GLOBAL, 
+    cublasErrCheck(cublasGemmEx(cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N, 
+					64, 64, 64, 
 					&alpha_g,
-					mix_wmma_B, CUDA_R_16F, K_GLOBAL,
-					mix_wmma_A, CUDA_R_16F, K_GLOBAL,
+					mix_wmma_B, CUDA_R_16F, 64,
+					mix_wmma_A, CUDA_R_16F, 64,
 					&beta_g, 
-					mix_wmma_C, CUDA_R_32F, N_GLOBAL,
+					mix_wmma_C, CUDA_R_32F, 64,
 					CUDA_R_32F, CUBLAS_GEMM_DFALT_TENSOR_OP));
+	cudaErrCheck(cudaMemset(mix_wmma_C, 0, sizeof(float) * M_GLOBAL * N_GLOBAL));
+
+
+    cudaErrCheck(cudaEventRecord(startKERNEL));
+    for(int i = 0; i < wmma_iter; i++) {
+        cublasErrCheck(cublasGemmEx(cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N, 
+                        N_GLOBAL, M_GLOBAL, K_GLOBAL, 
+                        &alpha_g,
+                        mix_wmma_B, CUDA_R_16F, K_GLOBAL,
+                        mix_wmma_A, CUDA_R_16F, K_GLOBAL,
+                        &beta_g, 
+                        mix_wmma_C, CUDA_R_32F, N_GLOBAL,
+                        CUDA_R_32F, CUBLAS_GEMM_DFALT_TENSOR_OP));
+    }
     cudaErrCheck(cudaEventRecord(stopKERNEL));
     cudaErrCheck(cudaEventSynchronize(stopKERNEL));
     cudaErrCheck(cudaEventElapsedTime(&kernel_time, startKERNEL, stopKERNEL));
-    printf("[ORI] tzgemm took %f ms\n", kernel_time);
+    printf("[ORI] cublas took %f us\n", kernel_time * 1000 /wmma_iter);
     
 
     printf("Checking results...\n");
@@ -183,9 +199,9 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < M_GLOBAL * N_GLOBAL; i++) {
         float v1 = ori_result_C[i];
         float v2 = mix_result_C[i];
-        if (fabs(v1 - v2) > 0.001f) {
+        if (fabs(v1 - v2) > 0.00001f) {
             errors++;
-            if (errors < 20) printf("%f %f\n", v1, v2);
+            if (errors < 5) printf("%f %f\n", v1, v2);
         }
 		// if (i < 10) printf("%f %f\n", ori_result_C[i], mix_result_C[i]);
     }
