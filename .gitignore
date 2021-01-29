@@ -1,1 +1,4 @@
 tzgemm_out
+tzgemm_mix
+sgemm_mix
+sgemm_stream
