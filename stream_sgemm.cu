@@ -61,7 +61,7 @@ int main(int argc, char* argv[]) {
     int M_INPUT = 128;
 	int N_INPUT = 3136;
 	int K_INPUT = 1152;
-	int mixwarp = 3;
+	int mixwarp = 2;
     if (argc == 2) {
         printf("\
         sgemm_blks = 2\n\
@@ -173,6 +173,9 @@ int main(int argc, char* argv[]) {
     cudaErrCheck(cudaMemcpy(sgemm_pers_b, sgemm_ori_b, NORMAL_K * NORMAL_N * sizeof(float), cudaMemcpyDeviceToDevice));
     curandErrCheck(curandDestroyGenerator(gen));
 
+
+
+
     // SOLO running
     // ---------------------------------------------------------------------------------------
     dim3 wmma_grid;
@@ -189,7 +192,7 @@ int main(int argc, char* argv[]) {
 	printf("SHMEM_SZ %d \n", SHMEM_SZ);
     cudaErrCheck(cudaFuncSetAttribute(
 		pers_tzgemm, cudaFuncAttributeMaxDynamicSharedMemorySize, SHMEM_SZ));
-
+        
     printf("[PERS] Running with tzgemm...\n");
     printf("[PERS] wmma_grid -- %d * %d wmma_block -- %d * %d \n", wmma_grid.x, wmma_grid.y, wmma_block.x, wmma_block.y);
 
@@ -249,19 +252,40 @@ int main(int argc, char* argv[]) {
     printf("[PERS] sgemm took %f ms\n\n", kernel_time);
     serial_time += kernel_time;
 
+    
+    // SM ID variables
+    // ---------------------------------------------------------------------------------------
+    unsigned int *smid_wmma_host;
+    unsigned int *smid_sgemm_host;
+
+    unsigned int *smid_wmma_device;
+    unsigned int *smid_sgemm_device;
+
+	smid_wmma_host = (unsigned int *)malloc(wmma_grid.x * wmma_grid.y * wmma_grid.z * sizeof(unsigned int));
+	smid_sgemm_host = (unsigned int *)malloc(sgemm_grid.x * sgemm_grid.y * sgemm_grid.z * sizeof(unsigned int));
+
+    cudaErrCheck(cudaMalloc((void**)&smid_wmma_device, wmma_grid.x * wmma_grid.y * wmma_grid.z * sizeof(unsigned int)));
+    cudaErrCheck(cudaMalloc((void**)&smid_sgemm_device, sgemm_grid.x * sgemm_grid.y * sgemm_grid.z * sizeof(unsigned int)));
+
+
+
 	// MIX running 
     // ----------------------------------------------------------------------------------------------------------------------
+
+    cudaErrCheck(cudaFuncSetAttribute(
+        pers_tzgemm_1, cudaFuncAttributeMaxDynamicSharedMemorySize, SHMEM_SZ));
+
 	if (mixwarp == 2) {
 		cudaErrCheck(cudaEventRecord(startKERNEL));
         for (int i = 0; i < 1; i++) {
-            checkKernelErrors((pers_tzgemm<<<wmma_grid, wmma_block, SHMEM_SZ, streams[0]>>>(
-                wmma_ori_a, wmma_ori_b, wmma_ori_c, 
-                //MATRIX_M, MATRIX_N, MATRIX_K,
-                wmma_grid_dim_x, wmma_block_dim_x, wmma_iter / 1
-            )));
             checkKernelErrors((pers_sgemm <<< sgemm_grid, sgemm_block, 0, streams[1] >>> (sgemm_ori_a, sgemm_ori_b, sgemm_ori_c, 
                 NORMAL_M, NORMAL_N, NORMAL_K,
-                sgemm_grid_dim_x, sgemm_grid_dim_y, sgemm_block_dim_x, sgemm_block_dim_y, sgemm_iter / 1)));
+                sgemm_grid_dim_x, sgemm_grid_dim_y, sgemm_block_dim_x, sgemm_block_dim_y, sgemm_iter / 1, smid_sgemm_device)));
+            checkKernelErrors((pers_tzgemm_1<<<wmma_grid, wmma_block, SHMEM_SZ, streams[0]>>>(
+                wmma_ori_a, wmma_ori_b, wmma_ori_c, 
+                //MATRIX_M, MATRIX_N, MATRIX_K,
+                wmma_grid_dim_x, wmma_block_dim_x, wmma_iter / 1, smid_wmma_device
+            )));
         }
 		
 		cudaErrCheck(cudaEventRecord(stopKERNEL));
@@ -276,12 +300,12 @@ int main(int argc, char* argv[]) {
 
         printf("[PERS] wmma_grid -- %d * %d wmma_block -- %d * %d \n", wmma_grid.x, wmma_grid.y, wmma_block.x, wmma_block.y);
         cudaErrCheck(cudaEventRecord(startKERNEL));
-        checkKernelErrors((pers_tzgemm<<<wmma_grid, wmma_block, SHMEM_SZ, streams[1]>>>(wmma_ori_a, wmma_ori_b, wmma_ori_c, 
+        checkKernelErrors((pers_tzgemm_1<<<wmma_grid, wmma_block, SHMEM_SZ, streams[1]>>>(wmma_ori_a, wmma_ori_b, wmma_ori_c, 
             //MATRIX_M, MATRIX_N, MATRIX_K,
-            wmma_grid_dim_x, wmma_block_dim_x, wmma_iter)));
+            wmma_grid_dim_x, wmma_block_dim_x, wmma_iter, smid_wmma_device)));
 		checkKernelErrors((ori_sgemm <<< sgemm_grid, sgemm_block, 0, streams[0] >>> (sgemm_ori_a, sgemm_ori_b, sgemm_ori_c, 
 			NORMAL_M, NORMAL_N, NORMAL_K,
-			sgemm_iter)));
+			sgemm_iter, smid_sgemm_device)));
 		
 		cudaErrCheck(cudaEventRecord(stopKERNEL));
 		cudaErrCheck(cudaEventSynchronize(stopKERNEL));
@@ -291,6 +315,27 @@ int main(int argc, char* argv[]) {
 
     printf("[STAT] Overlap rate: %.2f\n", (serial_time - kernel_time) * 100 / serial_time);
     printf("[STAT] Throughput speedup: %.2f\n", (serial_time / kernel_time - 1) * 100);
+
+	// Checking SM ID
+    // ---------------------------------------------------------------------------------------
+    cudaErrCheck(cudaMemcpy(smid_wmma_host, smid_wmma_device, wmma_grid.x * wmma_grid.y * wmma_grid.z * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    cudaErrCheck(cudaMemcpy(smid_sgemm_host, smid_sgemm_device, sgemm_grid.x * sgemm_grid.y * sgemm_grid.z * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+
+
+    printf("%d\n", wmma_grid.x * wmma_grid.y * wmma_grid.z);
+    printf("%d\n", sgemm_grid.x * sgemm_grid.y * sgemm_grid.z);
+
+
+    for(int i = 0; i<sgemm_grid.x * sgemm_grid.y * sgemm_grid.z; i++)
+        printf("%d ", smid_sgemm_host[i]);
+    printf("\n\n");
+    
+    for(int i = 0; i<wmma_grid.x * wmma_grid.y * wmma_grid.z; i++)
+        printf("%d ", smid_wmma_host[i]);
+
+    printf("\n\n");
+        
+
 
 	// Checking results
     // ---------------------------------------------------------------------------------------
